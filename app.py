@@ -403,7 +403,17 @@ def header():
 # ITENS
 # ======================================================
 BASE_ITEM_COLS = ["id", "type", "name"]
-PREFERRED_GENERAL_ORDER = ["name", "category", "tags", "yield", "total_time_min", "cover_photo_url", "training_video_url"]
+PREFERRED_GENERAL_ORDER = [
+    "name",
+    "category",
+    "concept",
+    "strategy",
+    "tags",
+    "yield",
+    "total_time_min",
+    "cover_photo_url",
+    "training_video_url",
+]
 
 
 def ensure_item_min_schema(items: pd.DataFrame) -> pd.DataFrame:
@@ -537,7 +547,6 @@ def render_media(item: dict, all_cols: list[str]):
                         components.iframe(prev, height=420)
                     st.link_button("Abrir vídeo", rawv, use_container_width=True)
             else:
-                # Ajuste solicitado: YouTube Shorts e variações
                 yt_id = extract_youtube_id(rawv)
                 if yt_id:
                     st.video(normalize_youtube_url(rawv))
@@ -675,6 +684,13 @@ def main():
     if meta_parts:
         st.markdown(f"<div class='muted'>{' | '.join(meta_parts)}</div>", unsafe_allow_html=True)
 
+    for c in ["concept", "strategy"]:
+        if c in all_cols:
+            v = str(item.get(c, "")).strip()
+            if v:
+                st.markdown(f"### {prettify_label(c)}")
+                st.text(v)
+
     if modo == "Serviço":
         mode_cols = get_mode_cols(all_cols, "service_")
         render_text_sections(item, mode_cols)
@@ -685,6 +701,8 @@ def main():
     _, extra_general = get_general_cols(all_cols)
     filled_extras = []
     for c in extra_general:
+        if c in ["concept", "strategy"]:
+            continue
         v = str(item.get(c, "")).strip()
         if v:
             filled_extras.append(c)
@@ -719,6 +737,12 @@ def main():
 
         if "tags" in all_cols:
             edited["tags"] = st.text_input("Tags (separadas por vírgula)", value=str(item.get("tags", "")))
+
+        if "concept" in all_cols:
+            edited["concept"] = st.text_area("Concept", value=str(item.get("concept", "")), height=100)
+
+        if "strategy" in all_cols:
+            edited["strategy"] = st.text_area("Strategy", value=str(item.get("strategy", "")), height=100)
 
         if "cover_photo_url" in all_cols:
             edited["cover_photo_url"] = st.text_input("Foto capa (URL ou Drive)", value=str(item.get("cover_photo_url", "")))
@@ -786,6 +810,12 @@ def main():
         st.subheader("Chefe · Editar conteúdo")
 
         edited = dict(item)
+
+        if "concept" in all_cols:
+            edited["concept"] = st.text_area("Concept", value=str(item.get("concept", "")), height=100)
+
+        if "strategy" in all_cols:
+            edited["strategy"] = st.text_area("Strategy", value=str(item.get("strategy", "")), height=100)
 
         if "cover_photo_url" in all_cols:
             edited["cover_photo_url"] = st.text_input("Foto capa (URL ou Drive)", value=str(item.get("cover_photo_url", "")))
