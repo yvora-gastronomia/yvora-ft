@@ -1,6 +1,7 @@
 import io
 import re
 import time
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -286,10 +287,14 @@ def drive_download_bytes(file_id: str) -> bytes:
 ROLE_LABEL = {"viewer": "Cozinha", "editor": "Chefe", "admin": "Administrador"}
 REQUIRED_USER_COLS = ["username", "password", "role", "active", "can_drinks", "can_pratos"]
 
+AUTH_STORAGE_KEY = "yvora_fichas_auth_v1"
+AUTH_DURATION_SECONDS = 48 * 60 * 60
+
 
 def logout():
     for k in ["auth", "item", "login_user", "login_pass", "confirm_delete", "creating_new"]:
         st.session_state.pop(k, None)
+    st.session_state["_clear_browser_auth"] = True
 
 
 def is_admin() -> bool:
@@ -315,6 +320,112 @@ def validate_users_df(users: pd.DataFrame):
     missing = [c for c in REQUIRED_USER_COLS if c not in users.columns]
     if missing:
         raise ValueError(f"Faltam colunas na aba users: {', '.join(missing)}")
+
+
+def browser_auth_get():
+    return components.html(
+        f"""
+        <script>
+        const key = {json.dumps(AUTH_STORAGE_KEY)};
+        const value = window.localStorage.getItem(key) || "";
+        window.parent.postMessage({{
+            isStreamlitMessage: true,
+            type: "streamlit:setComponentValue",
+            value: value
+        }}, "*");
+        </script>
+        """,
+        height=0,
+        key="browser_auth_get",
+    )
+
+
+def browser_auth_set(payload: str):
+    components.html(
+        f"""
+        <script>
+        const key = {json.dumps(AUTH_STORAGE_KEY)};
+        const value = {json.dumps(payload)};
+        window.localStorage.setItem(key, value);
+        </script>
+        """,
+        height=0,
+        key=f"browser_auth_set_{abs(hash(payload))}",
+    )
+
+
+def browser_auth_clear():
+    components.html(
+        f"""
+        <script>
+        const key = {json.dumps(AUTH_STORAGE_KEY)};
+        window.localStorage.removeItem(key);
+        </script>
+        """,
+        height=0,
+        key="browser_auth_clear",
+    )
+
+
+def build_auth_payload(row: pd.Series) -> str:
+    payload = {
+        "username": str(row["username"]),
+        "expires_at": int(time.time()) + AUTH_DURATION_SECONDS,
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def try_restore_auth_from_browser(users: pd.DataFrame):
+    if "auth" in st.session_state:
+        return
+
+    raw = browser_auth_get()
+    if not raw:
+        return
+
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        browser_auth_clear()
+        return
+
+    expires_at = int(payload.get("expires_at", 0))
+    username = str(payload.get("username", "")).strip()
+
+    if not username or expires_at <= int(time.time()):
+        browser_auth_clear()
+        return
+
+    df = users.copy()
+    for c in ["active", "can_drinks", "can_pratos"]:
+        df[c] = df[c].astype(str)
+
+    match = df[
+        (df["username"].astype(str) == username) &
+        (df["active"] == "1")
+    ]
+
+    if match.empty:
+        browser_auth_clear()
+        return
+
+    row = match.iloc[0]
+    st.session_state["auth"] = {
+        "username": str(row["username"]),
+        "role": str(row["role"]),
+        "can_drinks": str(row["can_drinks"]),
+        "can_pratos": str(row["can_pratos"]),
+    }
+    st.rerun()
+
+
+def sync_browser_auth():
+    if st.session_state.pop("_clear_browser_auth", False):
+        browser_auth_clear()
+
+    payload = st.session_state.pop("_save_browser_auth", None)
+    if payload:
+        browser_auth_set(payload)
 
 
 def login(users: pd.DataFrame):
@@ -348,6 +459,7 @@ def login(users: pd.DataFrame):
                     "can_drinks": str(row["can_drinks"]),
                     "can_pratos": str(row["can_pratos"]),
                 }
+                st.session_state["_save_browser_auth"] = build_auth_payload(row)
                 st.session_state.pop("item", None)
                 st.session_state.pop("creating_new", None)
                 st.rerun()
@@ -558,8 +670,6 @@ def render_media(item: dict, all_cols: list[str]):
 # APP
 # ======================================================
 def main():
-    header()
-
     users_tab = st.secrets.get("USERS_TAB", "users")
     items_tab = st.secrets.get("ITEMS_TAB", "items")
 
@@ -568,6 +678,11 @@ def main():
     except Exception as e:
         st.error(f"Erro lendo aba users: {e}")
         return
+
+    sync_browser_auth()
+    try_restore_auth_from_browser(users)
+
+    header()
 
     if "auth" not in st.session_state:
         try:
@@ -715,7 +830,7 @@ def main():
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ADMIN CRUD com sync para planilha (mantido igual ao seu arquivo)
+    # ADMIN CRUD com sync para planilha
     if is_admin():
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.subheader("Administrador · Gerenciar item")
@@ -845,6 +960,6 @@ def main():
 
 
 # ======================================================
-# START (apenas 1 chamada)
+# START
 # ======================================================
 main()
