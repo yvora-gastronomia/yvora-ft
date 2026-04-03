@@ -336,7 +336,7 @@ def browser_auth_get():
         </script>
         """,
         height=0,
-        key="browser_auth_get",
+        width=0,
     )
 
 
@@ -350,7 +350,7 @@ def browser_auth_set(payload: str):
         </script>
         """,
         height=0,
-        key=f"browser_auth_set_{abs(hash(payload))}",
+        width=0,
     )
 
 
@@ -363,7 +363,7 @@ def browser_auth_clear():
         </script>
         """,
         height=0,
-        key="browser_auth_clear",
+        width=0,
     )
 
 
