@@ -6,24 +6,17 @@ from typing import Optional, List, Dict, Tuple, Any
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 
-# ======================================================
-# CONFIG
-# ======================================================
 st.set_page_config(
     page_title="Yvora | Fichas Técnicas",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-# ======================================================
-# ESTILO YVORA
-# ======================================================
 st.markdown(
     """
 <style>
@@ -94,32 +87,42 @@ hr {
     color: rgba(0,0,0,0.55);
     font-size: 12px;
 }
-.section-title {
-    font-weight: 700;
-    font-size: 18px;
-    margin-bottom: 8px;
-}
-.debug-box {
-    background: #fff7e6;
-    border: 1px solid #f3d28b;
-    color: #5f4500;
-    border-radius: 14px;
-    padding: 12px 14px;
-    margin-bottom: 12px;
-    font-size: 14px;
-}
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# ======================================================
-# LOGO
-# ======================================================
 LOGO_CANDIDATES = [
     "Yvora_logo.png", "Yvora_logo.jpg", "Yvora_logo.jpeg", "Yvora_logo.webp",
     "yvora_logo.png", "yvora_logo.jpg", "yvora_logo.jpeg", "yvora_logo.webp",
     "YVORA_logo.png", "YVORA_logo.jpg", "YVORA_logo.jpeg", "YVORA_logo.webp",
+]
+
+ROLE_LABEL = {
+    "viewer": "Cozinha",
+    "editor": "Chefe",
+    "admin": "Administrador",
+}
+
+REQUIRED_USER_COLS = ["username", "password", "role", "active", "can_drinks", "can_pratos"]
+
+BASE_ITEM_COLS = ["id", "type", "name"]
+
+PREFERRED_GENERAL_ORDER = [
+    "name",
+    "category",
+    "concept",
+    "strategy",
+    "tags",
+    "yield",
+    "total_time_min",
+    "cover_photo_url",
+    "training_video_url",
+]
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
 ]
 
 
@@ -138,28 +141,6 @@ def find_logo_path() -> Optional[str]:
     return None
 
 
-# ======================================================
-# DEBUG
-# ======================================================
-DEBUG_MODE = False
-
-
-def set_debug_mode():
-    global DEBUG_MODE
-    try:
-        DEBUG_MODE = bool(st.secrets.get("DEBUG", False))
-    except Exception:
-        DEBUG_MODE = False
-
-
-def debug(msg: str):
-    if DEBUG_MODE:
-        st.markdown(f"<div class='debug-box'>{msg}</div>", unsafe_allow_html=True)
-
-
-# ======================================================
-# SECRETS / CONFIG
-# ======================================================
 def secret_get(key: str, default=None):
     try:
         return st.secrets[key]
@@ -168,7 +149,7 @@ def secret_get(key: str, default=None):
 
 
 def nested_secret_get(path: List[str], default=None):
-    cur: Any = st.secrets
+    cur = st.secrets
     try:
         for part in path:
             cur = cur[part]
@@ -186,40 +167,33 @@ def get_sheet_id() -> str:
     if sheet_id:
         return str(sheet_id).strip()
 
-    raise ValueError(
-        "SHEET_ID não encontrado. Configure em secrets.toml como SHEET_ID ou [gsheets].sheet_id."
-    )
+    raise ValueError("SHEET_ID não encontrado nos secrets.")
 
 
 def get_users_tab() -> str:
-    return str(secret_get("USERS_TAB", nested_secret_get(["gsheets", "users_ws"], "users"))).strip()
+    return str(secret_get("USERS_TAB", "users")).strip()
 
 
 def get_items_tab() -> str:
-    return str(secret_get("ITEMS_TAB", nested_secret_get(["gsheets", "items_ws"], "items"))).strip()
+    return str(secret_get("ITEMS_TAB", "items")).strip()
 
 
 def get_gcp_service_account_dict() -> dict:
     gcp = secret_get("gcp_service_account")
-    if isinstance(gcp, dict):
+    if gcp is None:
+        raise ValueError("gcp_service_account não encontrado nos secrets.")
+
+    try:
         return dict(gcp)
-
-    possible = nested_secret_get(["gcp_service_account"])
-    if isinstance(possible, dict):
-        return dict(possible)
-
-    raise ValueError(
-        "gcp_service_account não encontrado ou inválido nos secrets."
-    )
+    except Exception:
+        raise ValueError("gcp_service_account inválido. Deve ser um bloco TOML válido.")
 
 
 def validate_runtime_config() -> List[str]:
     errors = []
 
     try:
-        sheet_id = get_sheet_id()
-        if not sheet_id:
-            errors.append("SHEET_ID vazio.")
+        _ = get_sheet_id()
     except Exception as e:
         errors.append(str(e))
 
@@ -235,93 +209,11 @@ def validate_runtime_config() -> List[str]:
         ]
         missing = [k for k in required if not gcp.get(k)]
         if missing:
-            errors.append(
-                "gcp_service_account incompleto. Faltam: " + ", ".join(missing)
-            )
+            errors.append("gcp_service_account incompleto. Faltam: " + ", ".join(missing))
     except Exception as e:
         errors.append(str(e))
 
     return errors
-
-
-# ======================================================
-# HELPERS URL
-# ======================================================
-def extract_drive_file_id(url: str) -> Optional[str]:
-    if not url:
-        return None
-
-    u = str(url).strip()
-    patterns = [
-        r"/file/d/([a-zA-Z0-9_-]+)",
-        r"[?&]id=([a-zA-Z0-9_-]+)",
-        r"/uc\?.*id=([a-zA-Z0-9_-]+)",
-        r"/d/([a-zA-Z0-9_-]+)",
-    ]
-
-    for pattern in patterns:
-        m = re.search(pattern, u)
-        if m:
-            return m.group(1)
-
-    return None
-
-
-def normalize_drive_direct_view(url: str) -> str:
-    fid = extract_drive_file_id(url)
-    if not fid:
-        return url
-    return f"https://drive.google.com/uc?export=view&id={fid}"
-
-
-def drive_preview_url(url: str) -> Optional[str]:
-    fid = extract_drive_file_id(url)
-    if not fid:
-        return None
-    return f"https://drive.google.com/file/d/{fid}/preview"
-
-
-def drive_thumbnail_url(url: str, size: int = 1400) -> Optional[str]:
-    fid = extract_drive_file_id(url)
-    if not fid:
-        return None
-    return f"https://drive.google.com/thumbnail?id={fid}&sz=w{size}"
-
-
-def extract_youtube_id(url: str) -> Optional[str]:
-    if not url:
-        return None
-
-    u = str(url).strip()
-    patterns = [
-        r"youtu\.be/([a-zA-Z0-9_-]{6,})",
-        r"[?&]v=([a-zA-Z0-9_-]{6,})",
-        r"youtube\.com/shorts/([a-zA-Z0-9_-]{6,})",
-        r"youtube\.com/embed/([a-zA-Z0-9_-]{6,})",
-    ]
-
-    for pattern in patterns:
-        m = re.search(pattern, u)
-        if m:
-            return m.group(1)
-
-    return None
-
-
-def normalize_youtube_url(url: str) -> str:
-    vid = extract_youtube_id(url)
-    if not vid:
-        return url
-    return f"https://www.youtube.com/watch?v={vid}"
-
-
-# ======================================================
-# GOOGLE APIS
-# ======================================================
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
 
 
 @st.cache_resource
@@ -410,10 +302,9 @@ def read_sheet_values_fast(tab: str) -> pd.DataFrame:
 
     header = [str(x).strip() for x in values[0]]
     rows = values[1:]
-
     width = len(header)
-    normalized_rows = []
 
+    normalized_rows = []
     for r in rows:
         row = list(r[:width]) + [""] * max(0, width - len(r))
         normalized_rows.append(row)
@@ -458,7 +349,6 @@ def find_row_number_by_id(tab: str, item_id: str) -> Optional[int]:
         current = row[id_idx] if id_idx < len(row) else ""
         if str(current).strip() == str(item_id).strip():
             return i
-
     return None
 
 
@@ -527,21 +417,6 @@ def delete_item_row(tab: str, item_id: str):
     clear_sheet_caches()
 
 
-# ======================================================
-# AUTH
-# ======================================================
-ROLE_LABEL = {
-    "viewer": "Cozinha",
-    "editor": "Chefe",
-    "admin": "Administrador",
-}
-
-REQUIRED_USER_COLS = ["username", "password", "role", "active", "can_drinks", "can_pratos"]
-
-AUTH_STORAGE_KEY = "yvora_ft_auth_v1"
-AUTH_EXPIRY_DAYS = 7
-
-
 def logout():
     for k in [
         "auth",
@@ -552,17 +427,6 @@ def logout():
         "creating_new",
     ]:
         st.session_state.pop(k, None)
-
-    components.html(
-        f"""
-        <script>
-        try {{
-            localStorage.removeItem("{AUTH_STORAGE_KEY}");
-        }} catch (e) {{}}
-        </script>
-        """,
-        height=0,
-    )
 
 
 def is_admin() -> bool:
@@ -594,90 +458,8 @@ def validate_users_df(users: pd.DataFrame):
         raise ValueError(f"Faltam colunas na aba users: {', '.join(missing)}")
 
 
-def inject_auth_restore_script():
-    components.html(
-        f"""
-        <script>
-        (function() {{
-            try {{
-                const key = "{AUTH_STORAGE_KEY}";
-                const raw = localStorage.getItem(key);
-                if (!raw) return;
-
-                const parsed = JSON.parse(raw);
-                if (!parsed || !parsed.expiry || !parsed.payload) return;
-
-                const now = Date.now();
-                if (now > parsed.expiry) {{
-                    localStorage.removeItem(key);
-                    return;
-                }}
-
-                const username = parsed.payload.username || "";
-                const role = parsed.payload.role || "";
-                const can_drinks = parsed.payload.can_drinks || "";
-                const can_pratos = parsed.payload.can_pratos || "";
-
-                const target = window.parent.document;
-                const keys = target.querySelectorAll('input');
-
-                const signal = target.getElementById("yvora_restore_signal");
-                if (signal && !signal.value) {{
-                    signal.value = JSON.stringify({{
-                        username, role, can_drinks, can_pratos
-                    }});
-                    signal.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                }}
-            }} catch (e) {{}}
-        }})();
-        </script>
-        """,
-        height=0,
-    )
-
-
-def persist_auth_local(auth_payload: dict):
-    expiry_ms = AUTH_EXPIRY_DAYS * 24 * 60 * 60 * 1000
-    components.html(
-        f"""
-        <script>
-        try {{
-            const key = "{AUTH_STORAGE_KEY}";
-            const data = {{
-                expiry: Date.now() + {expiry_ms},
-                payload: {auth_payload}
-            }};
-            localStorage.setItem(key, JSON.stringify(data));
-        }} catch (e) {{}}
-        </script>
-        """,
-        height=0,
-    )
-
-
 def login(users: pd.DataFrame):
     validate_users_df(users)
-    inject_auth_restore_script()
-
-    restore_signal = st.text_input(
-        "restore_signal",
-        key="yvora_restore_signal",
-        label_visibility="collapsed",
-    )
-
-    if "auth" not in st.session_state and restore_signal:
-        try:
-            payload = pd.read_json(f'[{restore_signal}]').iloc[0].to_dict()
-            if payload.get("username") and payload.get("role"):
-                st.session_state["auth"] = {
-                    "username": str(payload.get("username", "")),
-                    "role": str(payload.get("role", "")),
-                    "can_drinks": str(payload.get("can_drinks", "")),
-                    "can_pratos": str(payload.get("can_pratos", "")),
-                }
-                st.rerun()
-        except Exception:
-            pass
 
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.subheader("Login")
@@ -724,22 +506,11 @@ def login(users: pd.DataFrame):
             }
             st.session_state.pop("item", None)
             st.session_state.pop("creating_new", None)
-
-            persist_auth_local({
-                "username": str(row["username"]),
-                "role": str(row["role"]),
-                "can_drinks": str(row["can_drinks"]),
-                "can_pratos": str(row["can_pratos"]),
-            })
-
             st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-# ======================================================
-# HEADER
-# ======================================================
 def header():
     auth = st.session_state.get("auth")
     user_text = "Acesso"
@@ -779,24 +550,6 @@ def header():
                 logout()
                 st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
-
-
-# ======================================================
-# ITENS
-# ======================================================
-BASE_ITEM_COLS = ["id", "type", "name"]
-
-PREFERRED_GENERAL_ORDER = [
-    "name",
-    "category",
-    "concept",
-    "strategy",
-    "tags",
-    "yield",
-    "total_time_min",
-    "cover_photo_url",
-    "training_video_url",
-]
 
 
 def ensure_item_min_schema(items: pd.DataFrame) -> pd.DataFrame:
@@ -894,6 +647,72 @@ def safe_video(url: str):
         return False
 
 
+def extract_drive_file_id(url: str) -> Optional[str]:
+    if not url:
+        return None
+
+    u = str(url).strip()
+    patterns = [
+        r"/file/d/([a-zA-Z0-9_-]+)",
+        r"[?&]id=([a-zA-Z0-9_-]+)",
+        r"/uc\?.*id=([a-zA-Z0-9_-]+)",
+        r"/d/([a-zA-Z0-9_-]+)",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, u)
+        if m:
+            return m.group(1)
+    return None
+
+
+def normalize_drive_direct_view(url: str) -> str:
+    fid = extract_drive_file_id(url)
+    if not fid:
+        return url
+    return f"https://drive.google.com/uc?export=view&id={fid}"
+
+
+def drive_preview_url(url: str) -> Optional[str]:
+    fid = extract_drive_file_id(url)
+    if not fid:
+        return None
+    return f"https://drive.google.com/file/d/{fid}/preview"
+
+
+def drive_thumbnail_url(url: str, size: int = 1400) -> Optional[str]:
+    fid = extract_drive_file_id(url)
+    if not fid:
+        return None
+    return f"https://drive.google.com/thumbnail?id={fid}&sz=w{size}"
+
+
+def extract_youtube_id(url: str) -> Optional[str]:
+    if not url:
+        return None
+
+    u = str(url).strip()
+    patterns = [
+        r"youtu\.be/([a-zA-Z0-9_-]{6,})",
+        r"[?&]v=([a-zA-Z0-9_-]{6,})",
+        r"youtube\.com/shorts/([a-zA-Z0-9_-]{6,})",
+        r"youtube\.com/embed/([a-zA-Z0-9_-]{6,})",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, u)
+        if m:
+            return m.group(1)
+    return None
+
+
+def normalize_youtube_url(url: str) -> str:
+    vid = extract_youtube_id(url)
+    if not vid:
+        return url
+    return f"https://www.youtube.com/watch?v={vid}"
+
+
 def render_media(item: Dict[str, str], all_cols: List[str]):
     if "cover_photo_url" in all_cols:
         raw = str(item.get("cover_photo_url", "")).strip()
@@ -918,11 +737,10 @@ def render_media(item: Dict[str, str], all_cols: List[str]):
             else:
                 preview = drive_preview_url(rawv)
                 if preview:
-                    try:
-                        components.iframe(preview, height=420)
-                    except Exception:
-                        if not safe_video(rawv):
-                            st.caption("Vídeo indisponível no momento.")
+                    st.markdown(
+                        f'<iframe src="{preview}" width="100%" height="420" style="border:none;border-radius:12px;"></iframe>',
+                        unsafe_allow_html=True,
+                    )
                 else:
                     if not safe_video(rawv):
                         st.caption("Vídeo indisponível no momento.")
@@ -935,9 +753,6 @@ def build_item_from_row(row: pd.Series, all_cols: List[str]) -> Dict[str, str]:
     return item
 
 
-# ======================================================
-# FORMS
-# ======================================================
 def admin_item_form(item: Dict[str, str], all_cols: List[str], tipo_val: str, items_tab: str, creating_new: bool):
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.subheader("Administrador · Gerenciar item")
@@ -1082,12 +897,7 @@ def editor_item_form(item: Dict[str, str], all_cols: List[str], items_tab: str):
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-# ======================================================
-# MAIN
-# ======================================================
 def main():
-    set_debug_mode()
-
     config_errors = validate_runtime_config()
     if config_errors:
         st.error("Falha de configuração do app.")
@@ -1097,10 +907,6 @@ def main():
 
     users_tab = get_users_tab()
     items_tab = get_items_tab()
-
-    debug(f"Aba users: {users_tab}")
-    debug(f"Aba items: {items_tab}")
-    debug(f"SHEET_ID: {get_sheet_id()}")
 
     try:
         users = read_sheet_values_fast(users_tab)
@@ -1281,8 +1087,5 @@ def main():
         editor_item_form(item, all_cols, items_tab)
 
 
-# ======================================================
-# START
-# ======================================================
 if __name__ == "__main__":
     main()
