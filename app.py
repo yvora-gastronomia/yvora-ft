@@ -1,12 +1,12 @@
 import re
-import json
 import time
 import random
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -99,6 +99,15 @@ hr {
     font-size: 18px;
     margin-bottom: 8px;
 }
+.debug-box {
+    background: #fff7e6;
+    border: 1px solid #f3d28b;
+    color: #5f4500;
+    border-radius: 14px;
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    font-size: 14px;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -110,7 +119,7 @@ hr {
 LOGO_CANDIDATES = [
     "Yvora_logo.png", "Yvora_logo.jpg", "Yvora_logo.jpeg", "Yvora_logo.webp",
     "yvora_logo.png", "yvora_logo.jpg", "yvora_logo.jpeg", "yvora_logo.webp",
-    "Ivora_logo.png", "Ivora_logo.jpg", "Ivora_logo.jpeg", "Ivora_logo.webp",
+    "YVORA_logo.png", "YVORA_logo.jpg", "YVORA_logo.jpeg", "YVORA_logo.webp",
 ]
 
 
@@ -120,7 +129,119 @@ def find_logo_path() -> Optional[str]:
         p = base / name
         if p.exists():
             return str(p)
+    assets = base / "assets"
+    if assets.exists():
+        for name in LOGO_CANDIDATES:
+            p = assets / name
+            if p.exists():
+                return str(p)
     return None
+
+
+# ======================================================
+# DEBUG
+# ======================================================
+DEBUG_MODE = False
+
+
+def set_debug_mode():
+    global DEBUG_MODE
+    try:
+        DEBUG_MODE = bool(st.secrets.get("DEBUG", False))
+    except Exception:
+        DEBUG_MODE = False
+
+
+def debug(msg: str):
+    if DEBUG_MODE:
+        st.markdown(f"<div class='debug-box'>{msg}</div>", unsafe_allow_html=True)
+
+
+# ======================================================
+# SECRETS / CONFIG
+# ======================================================
+def secret_get(key: str, default=None):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return default
+
+
+def nested_secret_get(path: List[str], default=None):
+    cur: Any = st.secrets
+    try:
+        for part in path:
+            cur = cur[part]
+        return cur
+    except Exception:
+        return default
+
+
+def get_sheet_id() -> str:
+    sheet_id = secret_get("SHEET_ID")
+    if sheet_id:
+        return str(sheet_id).strip()
+
+    sheet_id = nested_secret_get(["gsheets", "sheet_id"])
+    if sheet_id:
+        return str(sheet_id).strip()
+
+    raise ValueError(
+        "SHEET_ID não encontrado. Configure em secrets.toml como SHEET_ID ou [gsheets].sheet_id."
+    )
+
+
+def get_users_tab() -> str:
+    return str(secret_get("USERS_TAB", nested_secret_get(["gsheets", "users_ws"], "users"))).strip()
+
+
+def get_items_tab() -> str:
+    return str(secret_get("ITEMS_TAB", nested_secret_get(["gsheets", "items_ws"], "items"))).strip()
+
+
+def get_gcp_service_account_dict() -> dict:
+    gcp = secret_get("gcp_service_account")
+    if isinstance(gcp, dict):
+        return dict(gcp)
+
+    possible = nested_secret_get(["gcp_service_account"])
+    if isinstance(possible, dict):
+        return dict(possible)
+
+    raise ValueError(
+        "gcp_service_account não encontrado ou inválido nos secrets."
+    )
+
+
+def validate_runtime_config() -> List[str]:
+    errors = []
+
+    try:
+        sheet_id = get_sheet_id()
+        if not sheet_id:
+            errors.append("SHEET_ID vazio.")
+    except Exception as e:
+        errors.append(str(e))
+
+    try:
+        gcp = get_gcp_service_account_dict()
+        required = [
+            "type",
+            "project_id",
+            "private_key_id",
+            "private_key",
+            "client_email",
+            "token_uri",
+        ]
+        missing = [k for k in required if not gcp.get(k)]
+        if missing:
+            errors.append(
+                "gcp_service_account incompleto. Faltam: " + ", ".join(missing)
+            )
+    except Exception as e:
+        errors.append(str(e))
+
+    return errors
 
 
 # ======================================================
@@ -129,14 +250,15 @@ def find_logo_path() -> Optional[str]:
 def extract_drive_file_id(url: str) -> Optional[str]:
     if not url:
         return None
-    u = str(url).strip()
 
+    u = str(url).strip()
     patterns = [
         r"/file/d/([a-zA-Z0-9_-]+)",
         r"[?&]id=([a-zA-Z0-9_-]+)",
         r"/uc\?.*id=([a-zA-Z0-9_-]+)",
         r"/d/([a-zA-Z0-9_-]+)",
     ]
+
     for pattern in patterns:
         m = re.search(pattern, u)
         if m:
@@ -169,14 +291,15 @@ def drive_thumbnail_url(url: str, size: int = 1400) -> Optional[str]:
 def extract_youtube_id(url: str) -> Optional[str]:
     if not url:
         return None
-    u = str(url).strip()
 
+    u = str(url).strip()
     patterns = [
         r"youtu\.be/([a-zA-Z0-9_-]{6,})",
         r"[?&]v=([a-zA-Z0-9_-]{6,})",
         r"youtube\.com/shorts/([a-zA-Z0-9_-]{6,})",
         r"youtube\.com/embed/([a-zA-Z0-9_-]{6,})",
     ]
+
     for pattern in patterns:
         m = re.search(pattern, u)
         if m:
@@ -204,7 +327,7 @@ SCOPES = [
 @st.cache_resource
 def get_creds():
     return Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
+        get_gcp_service_account_dict(),
         scopes=SCOPES,
     )
 
@@ -265,9 +388,16 @@ def get_sheet_id_by_title(spreadsheet_id: str, title: str) -> Optional[int]:
     return None
 
 
+def normalize_df_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
+
+
 @st.cache_data(ttl=20)
 def read_sheet_values_fast(tab: str) -> pd.DataFrame:
-    ssid = st.secrets["SHEET_ID"]
+    ssid = get_sheet_id()
+
     result = gs_call(
         sheets_service().spreadsheets().values().get,
         spreadsheetId=ssid,
@@ -278,30 +408,36 @@ def read_sheet_values_fast(tab: str) -> pd.DataFrame:
     if not values:
         return pd.DataFrame()
 
-    header = values[0]
+    header = [str(x).strip() for x in values[0]]
     rows = values[1:]
 
     width = len(header)
     normalized_rows = []
+
     for r in rows:
         row = list(r[:width]) + [""] * max(0, width - len(r))
         normalized_rows.append(row)
 
-    return pd.DataFrame(normalized_rows, columns=header)
+    df = pd.DataFrame(normalized_rows, columns=header)
+    df = normalize_df_columns(df)
+    return df.fillna("")
 
 
 @st.cache_data(ttl=20)
 def get_header_and_rows(tab: str) -> Tuple[List[str], List[List[str]]]:
-    ssid = st.secrets["SHEET_ID"]
+    ssid = get_sheet_id()
+
     result = gs_call(
         sheets_service().spreadsheets().values().get,
         spreadsheetId=ssid,
         range=tab,
     )
+
     values = result.get("values", [])
     if not values:
         return [], []
-    header = values[0]
+
+    header = [str(x).strip() for x in values[0]]
     rows = values[1:]
     return header, rows
 
@@ -322,11 +458,12 @@ def find_row_number_by_id(tab: str, item_id: str) -> Optional[int]:
         current = row[id_idx] if id_idx < len(row) else ""
         if str(current).strip() == str(item_id).strip():
             return i
+
     return None
 
 
 def update_item_row(tab: str, item: Dict[str, str]):
-    ssid = st.secrets["SHEET_ID"]
+    ssid = get_sheet_id()
     header, rows = get_header_and_rows(tab)
 
     if not header:
@@ -356,7 +493,7 @@ def update_item_row(tab: str, item: Dict[str, str]):
 
 
 def delete_item_row(tab: str, item_id: str):
-    ssid = st.secrets["SHEET_ID"]
+    ssid = get_sheet_id()
     row_num = find_row_number_by_id(tab, item_id)
     if row_num is None:
         raise ValueError("Item não encontrado para exclusão.")
@@ -401,6 +538,9 @@ ROLE_LABEL = {
 
 REQUIRED_USER_COLS = ["username", "password", "role", "active", "can_drinks", "can_pratos"]
 
+AUTH_STORAGE_KEY = "yvora_ft_auth_v1"
+AUTH_EXPIRY_DAYS = 7
+
 
 def logout():
     for k in [
@@ -413,6 +553,17 @@ def logout():
     ]:
         st.session_state.pop(k, None)
 
+    components.html(
+        f"""
+        <script>
+        try {{
+            localStorage.removeItem("{AUTH_STORAGE_KEY}");
+        }} catch (e) {{}}
+        </script>
+        """,
+        height=0,
+    )
+
 
 def is_admin() -> bool:
     return st.session_state.get("auth", {}).get("role") == "admin"
@@ -422,6 +573,10 @@ def can_edit() -> bool:
     return st.session_state.get("auth", {}).get("role") in ["admin", "editor"]
 
 
+def flag_is_true(v: Any) -> bool:
+    return str(v).strip().lower() in {"1", "true", "sim", "yes"}
+
+
 def has_access(module_type: str) -> bool:
     auth = st.session_state.get("auth", {})
     if not auth:
@@ -429,8 +584,8 @@ def has_access(module_type: str) -> bool:
     if auth.get("role") == "admin":
         return True
     if module_type == "drink":
-        return auth.get("can_drinks") == "1"
-    return auth.get("can_pratos") == "1"
+        return flag_is_true(auth.get("can_drinks"))
+    return flag_is_true(auth.get("can_pratos"))
 
 
 def validate_users_df(users: pd.DataFrame):
@@ -439,8 +594,90 @@ def validate_users_df(users: pd.DataFrame):
         raise ValueError(f"Faltam colunas na aba users: {', '.join(missing)}")
 
 
+def inject_auth_restore_script():
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            try {{
+                const key = "{AUTH_STORAGE_KEY}";
+                const raw = localStorage.getItem(key);
+                if (!raw) return;
+
+                const parsed = JSON.parse(raw);
+                if (!parsed || !parsed.expiry || !parsed.payload) return;
+
+                const now = Date.now();
+                if (now > parsed.expiry) {{
+                    localStorage.removeItem(key);
+                    return;
+                }}
+
+                const username = parsed.payload.username || "";
+                const role = parsed.payload.role || "";
+                const can_drinks = parsed.payload.can_drinks || "";
+                const can_pratos = parsed.payload.can_pratos || "";
+
+                const target = window.parent.document;
+                const keys = target.querySelectorAll('input');
+
+                const signal = target.getElementById("yvora_restore_signal");
+                if (signal && !signal.value) {{
+                    signal.value = JSON.stringify({{
+                        username, role, can_drinks, can_pratos
+                    }});
+                    signal.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                }}
+            }} catch (e) {{}}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def persist_auth_local(auth_payload: dict):
+    expiry_ms = AUTH_EXPIRY_DAYS * 24 * 60 * 60 * 1000
+    components.html(
+        f"""
+        <script>
+        try {{
+            const key = "{AUTH_STORAGE_KEY}";
+            const data = {{
+                expiry: Date.now() + {expiry_ms},
+                payload: {auth_payload}
+            }};
+            localStorage.setItem(key, JSON.stringify(data));
+        }} catch (e) {{}}
+        </script>
+        """,
+        height=0,
+    )
+
+
 def login(users: pd.DataFrame):
     validate_users_df(users)
+    inject_auth_restore_script()
+
+    restore_signal = st.text_input(
+        "restore_signal",
+        key="yvora_restore_signal",
+        label_visibility="collapsed",
+    )
+
+    if "auth" not in st.session_state and restore_signal:
+        try:
+            payload = pd.read_json(f'[{restore_signal}]').iloc[0].to_dict()
+            if payload.get("username") and payload.get("role"):
+                st.session_state["auth"] = {
+                    "username": str(payload.get("username", "")),
+                    "role": str(payload.get("role", "")),
+                    "can_drinks": str(payload.get("can_drinks", "")),
+                    "can_pratos": str(payload.get("can_pratos", "")),
+                }
+                st.rerun()
+        except Exception:
+            pass
 
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.subheader("Login")
@@ -459,12 +696,19 @@ def login(users: pd.DataFrame):
 
     if entrar:
         df = users.copy()
+
         for c in ["active", "can_drinks", "can_pratos"]:
-            df[c] = df[c].astype(str)
+            if c in df.columns:
+                df[c] = df[c].astype(str).str.strip()
+            else:
+                df[c] = ""
+
+        df["username"] = df["username"].astype(str).str.strip()
+        df["password"] = df["password"].astype(str).str.strip()
 
         match = df[
-            (df["username"].astype(str) == str(u)) &
-            (df["password"].astype(str) == str(p)) &
+            (df["username"] == str(u).strip()) &
+            (df["password"] == str(p).strip()) &
             (df["active"] == "1")
         ]
 
@@ -480,6 +724,14 @@ def login(users: pd.DataFrame):
             }
             st.session_state.pop("item", None)
             st.session_state.pop("creating_new", None)
+
+            persist_auth_local({
+                "username": str(row["username"]),
+                "role": str(row["role"]),
+                "can_drinks": str(row["can_drinks"]),
+                "can_pratos": str(row["can_pratos"]),
+            })
+
             st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
@@ -514,7 +766,10 @@ def header():
     if lp:
         colA, _ = st.columns([1, 3])
         with colA:
-            st.image(lp, use_container_width=True)
+            try:
+                st.image(lp, use_container_width=True)
+            except Exception:
+                pass
 
     if auth:
         col1, col2, col3 = st.columns([2, 2, 2])
@@ -549,7 +804,7 @@ def ensure_item_min_schema(items: pd.DataFrame) -> pd.DataFrame:
     for c in BASE_ITEM_COLS:
         if c not in out.columns:
             out[c] = ""
-    return out
+    return out.fillna("")
 
 
 def next_id(items: pd.DataFrame, prefix: str) -> str:
@@ -558,6 +813,7 @@ def next_id(items: pd.DataFrame, prefix: str) -> str:
 
     ids = items["id"].astype(str).tolist()
     nums: List[int] = []
+
     for x in ids:
         if x.startswith(prefix):
             tail = x.replace(prefix, "")
@@ -582,14 +838,18 @@ def get_mode_cols(all_cols: List[str], prefix: str) -> List[str]:
         f"{prefix}mise_en_place",
         f"{prefix}details",
         f"{prefix}common_mistakes",
+        f"{prefix}quality_check",
     ]
+
     ordered: List[str] = []
     for p in priority:
         if p in pref:
             ordered.append(p)
+
     for c in sorted(pref):
         if c not in ordered:
             ordered.append(c)
+
     return ordered
 
 
@@ -618,28 +878,54 @@ def render_text_sections(item: Dict[str, str], cols: List[str]):
         st.info("Sem informações preenchidas neste modo.")
 
 
+def safe_image(url_or_path: str):
+    try:
+        st.image(url_or_path, use_container_width=True)
+        return True
+    except Exception:
+        return False
+
+
+def safe_video(url: str):
+    try:
+        st.video(url)
+        return True
+    except Exception:
+        return False
+
+
 def render_media(item: Dict[str, str], all_cols: List[str]):
     if "cover_photo_url" in all_cols:
         raw = str(item.get("cover_photo_url", "")).strip()
         if raw:
             thumb = drive_thumbnail_url(raw)
+            direct = normalize_drive_direct_view(raw)
+
+            shown = False
             if thumb:
-                st.image(thumb, use_container_width=True)
-            else:
-                st.image(raw, use_container_width=True)
+                shown = safe_image(thumb)
+            if not shown:
+                shown = safe_image(direct)
+            if not shown:
+                safe_image(raw)
 
     if "training_video_url" in all_cols:
         rawv = str(item.get("training_video_url", "")).strip()
         if rawv:
             yt_id = extract_youtube_id(rawv)
             if yt_id:
-                st.video(normalize_youtube_url(rawv))
+                safe_video(normalize_youtube_url(rawv))
             else:
                 preview = drive_preview_url(rawv)
                 if preview:
-                    st.components.v1.iframe(preview, height=420)
+                    try:
+                        components.iframe(preview, height=420)
+                    except Exception:
+                        if not safe_video(rawv):
+                            st.caption("Vídeo indisponível no momento.")
                 else:
-                    st.video(rawv)
+                    if not safe_video(rawv):
+                        st.caption("Vídeo indisponível no momento.")
 
 
 def build_item_from_row(row: pd.Series, all_cols: List[str]) -> Dict[str, str]:
@@ -800,13 +1086,26 @@ def editor_item_form(item: Dict[str, str], all_cols: List[str], items_tab: str):
 # MAIN
 # ======================================================
 def main():
-    users_tab = st.secrets.get("USERS_TAB", "users")
-    items_tab = st.secrets.get("ITEMS_TAB", "items")
+    set_debug_mode()
+
+    config_errors = validate_runtime_config()
+    if config_errors:
+        st.error("Falha de configuração do app.")
+        for err in config_errors:
+            st.write(f"- {err}")
+        st.stop()
+
+    users_tab = get_users_tab()
+    items_tab = get_items_tab()
+
+    debug(f"Aba users: {users_tab}")
+    debug(f"Aba items: {items_tab}")
+    debug(f"SHEET_ID: {get_sheet_id()}")
 
     try:
         users = read_sheet_values_fast(users_tab)
     except Exception as e:
-        st.error(f"Erro lendo aba users: {e}")
+        st.error(f"Erro lendo aba users: {type(e).__name__}: {e}")
         return
 
     header()
@@ -822,7 +1121,7 @@ def main():
         items = read_sheet_values_fast(items_tab)
         items = ensure_item_min_schema(items)
     except Exception as e:
-        st.error(f"Erro lendo aba items: {e}")
+        st.error(f"Erro lendo aba items: {type(e).__name__}: {e}")
         return
 
     auth = st.session_state["auth"]
@@ -831,9 +1130,9 @@ def main():
     if auth.get("role") == "admin":
         allowed_modules = ["Drinks", "Pratos"]
     else:
-        if auth.get("can_drinks") == "1":
+        if flag_is_true(auth.get("can_drinks")):
             allowed_modules.append("Drinks")
-        if auth.get("can_pratos") == "1":
+        if flag_is_true(auth.get("can_pratos")):
             allowed_modules.append("Pratos")
 
     if not allowed_modules:
@@ -868,7 +1167,7 @@ def main():
         st.error("Sem permissão para acessar este módulo.")
         return
 
-    df = items[items["type"].astype(str).str.lower() == tipo_val].copy()
+    df = items[items["type"].astype(str).str.lower().str.strip() == tipo_val].copy()
 
     if busca and not df.empty:
         b = busca.strip().lower()
@@ -888,7 +1187,8 @@ def main():
     if df.empty:
         st.info("Nenhum item encontrado.")
     else:
-        show = df.sort_values("name" if "name" in df.columns else "id")
+        sort_col = "name" if "name" in df.columns else "id"
+        show = df.sort_values(sort_col)
         for _, row in show.iterrows():
             item_id = str(row.get("id", "")).strip()
             label = str(row.get("name", item_id)).strip() or item_id
@@ -916,7 +1216,7 @@ def main():
         item["type"] = tipo_val
         item["name"] = ""
     else:
-        match = items[items["id"].astype(str) == item_id]
+        match = items[items["id"].astype(str).str.strip() == item_id]
         if match.empty:
             st.warning("Item não encontrado na base.")
             return
