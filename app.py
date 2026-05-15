@@ -1,6 +1,5 @@
 import re
 import time
-import random
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any
 
@@ -121,31 +120,19 @@ PREFERRED_GENERAL_ORDER = [
     "training_video_url",
 ]
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
-
 CACHE_TTL_SECONDS = 30
 
 
-def load_google_libs():
-    """
-    Carrega as dependências do Google apenas quando necessário.
-
-    Isso evita que o app caia no cold start do Streamlit Cloud caso o namespace
-    google ainda não esteja corretamente inicializado no momento do import global.
-    """
+def load_gspread():
     try:
+        import gspread
         from google.oauth2.service_account import Credentials
-        from googleapiclient.discovery import build
-        from googleapiclient.errors import HttpError
-        return Credentials, build, HttpError
+        return gspread, Credentials
     except Exception as e:
         st.error("Falha ao carregar dependências Google.")
         st.caption(
-            "Confirme se requirements.txt e packages.txt estão atualizados. "
-            "Depois faça Clear cache e Reboot app no Streamlit Cloud."
+            "O ambiente do Streamlit Cloud não instalou gspread/google-auth corretamente. "
+            "Atualize requirements.txt, faça Clear cache e depois Reboot app."
         )
         st.exception(e)
         st.stop()
@@ -215,9 +202,14 @@ def get_gcp_service_account_dict() -> dict:
         raise ValueError("gcp_service_account não encontrado nos secrets.")
 
     try:
-        return dict(gcp)
+        gcp_dict = dict(gcp)
     except Exception:
         raise ValueError("gcp_service_account inválido. Deve ser um bloco TOML válido.")
+
+    if "private_key" in gcp_dict:
+        gcp_dict["private_key"] = str(gcp_dict["private_key"]).replace("\\n", "\n")
+
+    return gcp_dict
 
 
 def validate_runtime_config() -> List[str]:
@@ -247,69 +239,32 @@ def validate_runtime_config() -> List[str]:
     return errors
 
 
-def get_creds():
-    if "gcp_creds" not in st.session_state:
-        Credentials, _, _ = load_google_libs()
-        st.session_state["gcp_creds"] = Credentials.from_service_account_info(
+def get_gspread_client():
+    if "gspread_client" not in st.session_state:
+        gspread, Credentials = load_gspread()
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ]
+        creds = Credentials.from_service_account_info(
             get_gcp_service_account_dict(),
-            scopes=SCOPES,
+            scopes=scopes,
         )
+        st.session_state["gspread_client"] = gspread.authorize(creds)
 
-    return st.session_state["gcp_creds"]
-
-
-def sheets_service():
-    if "sheets_svc" not in st.session_state:
-        _, build, _ = load_google_libs()
-        st.session_state["sheets_svc"] = build(
-            "sheets",
-            "v4",
-            credentials=get_creds(),
-            cache_discovery=False,
-        )
-
-    return st.session_state["sheets_svc"]
+    return st.session_state["gspread_client"]
 
 
-def gs_call(fn, *args, retries: int = 5, base_sleep: float = 0.8, **kwargs):
-    _, _, HttpError = load_google_libs()
+def get_spreadsheet():
+    if "spreadsheet" not in st.session_state:
+        client = get_gspread_client()
+        st.session_state["spreadsheet"] = client.open_by_key(get_sheet_id())
 
-    last_exc = None
-
-    for attempt in range(retries):
-        try:
-            return fn(*args, **kwargs).execute()
-        except HttpError as e:
-            last_exc = e
-            status = getattr(e.resp, "status", None)
-
-            if status in (429, 500, 502, 503, 504):
-                sleep_s = base_sleep * (2 ** attempt) + random.uniform(0, 0.35)
-                time.sleep(sleep_s)
-                continue
-
-            raise
-        except Exception as e:
-            last_exc = e
-
-            if attempt < retries - 1:
-                sleep_s = base_sleep * (2 ** attempt) + random.uniform(0, 0.35)
-                time.sleep(sleep_s)
-                continue
-
-            raise
-
-    raise last_exc
+    return st.session_state["spreadsheet"]
 
 
-def col_to_a1(col_num: int) -> str:
-    result = ""
-
-    while col_num:
-        col_num, rem = divmod(col_num - 1, 26)
-        result = chr(65 + rem) + result
-
-    return result
+def get_worksheet(tab: str):
+    return get_spreadsheet().worksheet(tab)
 
 
 def _sheet_cache_key(tab: str) -> str:
@@ -336,15 +291,8 @@ def read_sheet_values_fast(tab: str) -> pd.DataFrame:
         if now - cached_at < CACHE_TTL_SECONDS:
             return st.session_state[ck]
 
-    ssid = get_sheet_id()
-
-    result = gs_call(
-        sheets_service().spreadsheets().values().get,
-        spreadsheetId=ssid,
-        range=tab,
-    )
-
-    values = result.get("values", [])
+    ws = get_worksheet(tab)
+    values = ws.get_all_values()
 
     if not values:
         df = pd.DataFrame()
@@ -372,15 +320,8 @@ def read_sheet_values_fast(tab: str) -> pd.DataFrame:
 
 
 def get_header_and_rows(tab: str) -> Tuple[List[str], List[List[str]]]:
-    ssid = get_sheet_id()
-
-    result = gs_call(
-        sheets_service().spreadsheets().values().get,
-        spreadsheetId=ssid,
-        range=tab,
-    )
-
-    values = result.get("values", [])
+    ws = get_worksheet(tab)
+    values = ws.get_all_values()
 
     if not values:
         return [], []
@@ -389,25 +330,6 @@ def get_header_and_rows(tab: str) -> Tuple[List[str], List[List[str]]]:
     rows = values[1:]
 
     return header, rows
-
-
-def get_sheet_metadata(spreadsheet_id: str) -> dict:
-    return gs_call(
-        sheets_service().spreadsheets().get,
-        spreadsheetId=spreadsheet_id,
-        fields="sheets(properties(sheetId,title))",
-    )
-
-
-def get_sheet_id_by_title(spreadsheet_id: str, title: str) -> Optional[int]:
-    meta = get_sheet_metadata(spreadsheet_id)
-
-    for sh in meta.get("sheets", []):
-        props = sh.get("properties", {})
-        if props.get("title") == title:
-            return int(props.get("sheetId"))
-
-    return None
 
 
 def find_row_number_by_id(tab: str, item_id: str) -> Optional[int]:
@@ -427,7 +349,7 @@ def find_row_number_by_id(tab: str, item_id: str) -> Optional[int]:
 
 
 def update_item_row(tab: str, item: Dict[str, str]):
-    ssid = get_sheet_id()
+    ws = get_worksheet(tab)
     header, rows = get_header_and_rows(tab)
 
     if not header:
@@ -442,53 +364,34 @@ def update_item_row(tab: str, item: Dict[str, str]):
         row_num = len(rows) + 2
 
     row_values = [str(item.get(col, "")) for col in header]
+    end_col = len(header)
 
-    end_col = col_to_a1(len(header))
-    target_range = f"{tab}!A{row_num}:{end_col}{row_num}"
-
-    gs_call(
-        sheets_service().spreadsheets().values().update,
-        spreadsheetId=ssid,
-        range=target_range,
-        valueInputOption="RAW",
-        body={"values": [row_values]},
+    ws.update(
+        range_name=f"A{row_num}:{rowcol_to_a1(row_num, end_col).replace(str(row_num), '')}{row_num}",
+        values=[row_values],
+        value_input_option="RAW",
     )
 
     clear_sheet_caches()
 
 
+def rowcol_to_a1(row: int, col: int) -> str:
+    result = ""
+    col_num = col
+    while col_num:
+        col_num, rem = divmod(col_num - 1, 26)
+        result = chr(65 + rem) + result
+    return f"{result}{row}"
+
+
 def delete_item_row(tab: str, item_id: str):
-    ssid = get_sheet_id()
+    ws = get_worksheet(tab)
     row_num = find_row_number_by_id(tab, item_id)
 
     if row_num is None:
         raise ValueError("Item não encontrado para exclusão.")
 
-    sheet_id = get_sheet_id_by_title(ssid, tab)
-    if sheet_id is None:
-        raise ValueError("Não foi possível localizar a aba para exclusão.")
-
-    start_index = row_num - 1
-    end_index = row_num
-
-    gs_call(
-        sheets_service().spreadsheets().batchUpdate,
-        spreadsheetId=ssid,
-        body={
-            "requests": [
-                {
-                    "deleteDimension": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "dimension": "ROWS",
-                            "startIndex": start_index,
-                            "endIndex": end_index,
-                        }
-                    }
-                }
-            ]
-        },
-    )
+    ws.delete_rows(row_num)
 
     clear_sheet_caches()
 
@@ -505,8 +408,8 @@ def logout():
         "login_pass",
         "confirm_delete",
         "creating_new",
-        "gcp_creds",
-        "sheets_svc",
+        "gspread_client",
+        "spreadsheet",
     ]
 
     for k in keys_to_clear:
@@ -1239,7 +1142,7 @@ def select_item_screen(items: pd.DataFrame, items_tab: str):
     with col1:
         filtro_tipo = st.selectbox(
             "Categoria",
-            tipo_opcoes if len(tipo_opcoes) > 1 else tipo_opcoes,
+            tipo_opcoes,
             key="filtro_tipo",
         )
 
@@ -1388,7 +1291,7 @@ def diagnostics_panel():
         with c1:
             if st.button("Testar dependências Google", use_container_width=True):
                 try:
-                    load_google_libs()
+                    load_gspread()
                     st.success("Dependências Google carregadas com sucesso.")
                 except Exception as e:
                     st.error(str(e))
@@ -1396,8 +1299,8 @@ def diagnostics_panel():
         with c2:
             if st.button("Limpar cache local", use_container_width=True):
                 clear_sheet_caches()
-                st.session_state.pop("sheets_svc", None)
-                st.session_state.pop("gcp_creds", None)
+                st.session_state.pop("gspread_client", None)
+                st.session_state.pop("spreadsheet", None)
                 st.success("Cache local limpo.")
 
         with c3:
