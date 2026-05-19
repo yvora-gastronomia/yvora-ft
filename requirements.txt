@@ -1,5 +1,7 @@
-streamlit==1.41.0
-pandas==2.2.2
-requests==2.32.3
-gspread==5.12.4
-google-auth==2.29.0
+streamlit
+pandas
+google-api-python-client
+google-auth
+google-auth-httplib2
+gspread
+requests
